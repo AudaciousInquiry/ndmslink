@@ -7,6 +7,7 @@ import com.lantanagroup.link.config.api.ApiConfig;
 import com.lantanagroup.link.model.ReportContext;
 import com.lantanagroup.link.model.ReportCriteria;
 import org.apache.commons.lang3.StringUtils;
+import org.hl7.fhir.instance.model.api.IBaseResource;
 import org.hl7.fhir.r4.model.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,6 +17,9 @@ import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.ParseException;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ForkJoinPool;
@@ -56,21 +60,55 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
 
                         logger.info("Generating measure report for patient {}", patient);
                         MeasureReport patientMeasureReport = new MeasureReport();
+                        String patientDataBundleId = ReportIdHelper.getPatientDataBundleId(reportContext.getMasterIdentifier(), patient.getId());
                         try {
-                            String patientDataBundleId = ReportIdHelper.getPatientDataBundleId(reportContext.getMasterIdentifier(), patient.getId());
 
-                            // get patient bundle from the FHIR Data Store Server
+                            logger.info("Patient Bundle ID: {}", patientDataBundleId);
+
+                            // Get the Patient bundle from the FHIR Data Store Server
                             FhirDataProvider fhirStoreProvider = new FhirDataProvider(config.getDataStore());
                             Bundle patientBundle = fhirStoreProvider.getBundleById(patientDataBundleId);
 
+                            // Get active Encounter(s) from Bundle by report generation start/end date
+                            List<Encounter> encounters = patientBundle.getEntry().stream()
+                                    .map(Bundle.BundleEntryComponent::getResource)
+                                    .filter(Encounter.class::isInstance)
+                                    .map(Encounter.class::cast)
+                                    .filter(encounter -> isEncounterInRange(encounter, startDate, endDate, patientDataBundleId))
+                                    .collect(Collectors.toList());
+
+                            // Loop encounters and pull associated Location options
+                            List<Location> relevantLocations = new ArrayList<>();
+                            encounters.forEach(encounter -> {
+                                List<Location> locs = getLocationsForEncounter(encounter, patientBundle);
+                                relevantLocations.addAll(locs);
+                            });
+
                             // Pull Location identifiers from Encounters if the Location has a period.start / period.end
                             // that falls in range of the passed in start/end dates when generating the reports.
+                            // TODO add relevat location check onto EncounterLocationComponent after Encounter
+                            // has been identified to contain a valid Location via date
+                            // I think we are pulling locations in that DO NOT have a date.  Becauce we are pulling the
+                            // encounter that has at least 1 relevant Locaiton with a date.  And then pulling all those locations.
                             List<String> relevantLocationIdentifiers = patientBundle.getEntry().stream()
                                     .map(Bundle.BundleEntryComponent::getResource)
                                     .filter(Encounter.class::isInstance)
                                     .map(Encounter.class::cast)
-                                    .filter(encounter -> hasRelevantLocation(encounter, startDate, endDate))
+                                    .filter(encounter -> hasRelevantLocation(encounter, startDate, endDate, patientDataBundleId))
                                     .flatMap(encounter -> encounter.getLocation().stream())
+                                    .map(location -> location.getLocation().getReference())
+                                    .filter(Objects::nonNull)  // remove nulls
+                                    .filter(ref -> !ref.isEmpty())  // remove empty strings
+                                    .distinct()
+                                    .collect(Collectors.toList());
+
+                            List<String> relevantLocationIdentifiersNOTGOOD = patientBundle.getEntry().stream()
+                                    .map(Bundle.BundleEntryComponent::getResource)
+                                    .filter(Encounter.class::isInstance)
+                                    .map(Encounter.class::cast)
+                                    .flatMap(encounter -> encounter.getLocation().stream())
+                                    // Now we filter the locations themselves using isLocationRelevantOrig
+                                    .filter(location -> isLocationRelevantOrig(location, startDate, endDate, patientDataBundleId))
                                     .map(location -> location.getLocation().getReference())
                                     .filter(Objects::nonNull)  // remove nulls
                                     .filter(ref -> !ref.isEmpty())  // remove empty strings
@@ -80,7 +118,7 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
                             // Pull relevant Location resources using the list if ID's generated in previous step.
                             // Filter out any Location that has no aliases as those are used for finding the Nebraska
                             // Med bed code.
-                            List<Location> relevantLocations = patientBundle.getEntry().stream()
+                            List<Location> relevantLocationsOLD = patientBundle.getEntry().stream()
                                     .map(Bundle.BundleEntryComponent::getResource)
                                     .filter(Location.class::isInstance)
                                     .map(Location.class::cast)
@@ -89,14 +127,47 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
                                     .collect(Collectors.toList());
 
                             for (Location location : relevantLocations) {
-                                if (location.hasAlias()) {
-                                    List<String> aliases = location.getAlias().stream()
-                                            .map(StringType::getValue)
-                                            .collect(Collectors.toList());
+
+                                List<String> aliases = location.getAlias().stream()
+                                        .map(StringType::getValue)
+                                        .collect(Collectors.toList());
+
+                                Location partOf = (Location)location.getPartOf().getResource();
+                                if (partOf != null) {
+                                    List<String> partOfAliases = partOf.getAlias().stream().map(StringType::getValue).collect(Collectors.toList());
+                                    aliases.addAll(partOfAliases);
+                                }
+
+                                if (!aliases.isEmpty()) {
 
                                     Optional<NhsnLocation> nhsnLocation = getNhsnLocation(nhsnLocations, aliases);
+                                    if (!nhsnLocation.isPresent()) {
+
+                                        // We want to log the location to go back and research
+                                        logger.info("UNMAPPED|{}|{}|{}|{}|{}|{}|{}",
+                                                patientDataBundleId,
+                                                location.getId(),
+                                                location.getName(),
+                                                location.getAlias().stream().map(StringType::toString).collect(Collectors.joining(",")),
+                                                location.getPartOf().getDisplay(),
+                                                Optional.ofNullable(partOf).map(p -> p.getId()).orElse(""),
+                                                Optional.ofNullable(partOf).map(p -> p.getAlias().stream().map(StringType::toString).collect(Collectors.joining(","))).orElse("")
+                                        );
+                                    } else {
+                                        NhsnLocation foundLocation = nhsnLocation.get();
+                                        logger.info("ISMAPPED|{}|{}|{}|{}|{}|{}|{}|{}",
+                                                foundLocation.getOrganizationId(),
+                                                foundLocation.getCode(),
+                                                foundLocation.getUnit(),
+                                                foundLocation.getCdcCode(),
+                                                foundLocation.getLocationCode(),
+                                                foundLocation.getCdcLabel(),
+                                                foundLocation.getStatus(),
+                                                foundLocation.getTrac2es()
+                                        );
+                                    }
                                     nhsnLocation.ifPresent(
-                                            loc -> {
+                                    loc -> {
 
                                                 // Lookup TRAC2ES Code
                                                 // TODO: !!! Right now if we do not have a NebMed to TRAC2ES Map then we do not include
@@ -116,6 +187,8 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
 
                                                     patientMeasureReport.addGroup(group);
 
+                                                    //logger.info("Patient Bundle Mapped: {}", patientDataBundleId);
+
                                                 }
                                             }
                                     );
@@ -123,7 +196,7 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
                             }
 
                         } catch (Exception ex) {
-                            logger.error("Issue generating patient measure report for {}, error {}", patient, ex.getMessage());
+                            logger.error("Issue generating patient measure report for {}, error {}", patientDataBundleId, ex.getMessage());
                         }
 
                         String measureReportId = ReportIdHelper.getPatientMeasureReportId(measureContext.getReportId(), patient.getId());
@@ -176,12 +249,35 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
 
     }
 
-    private static boolean hasRelevantLocation(Encounter encounter, Date startDate, Date endDate) {
-        return encounter.getLocation().stream()
-                .anyMatch(location -> isLocationRelevant(location, startDate, endDate));
+    private static boolean hasRelevantLocation(Encounter encounter, Date startDate, Date endDate, String patientBundleId) {
+        boolean returnValue = encounter.getLocation().stream()
+                .anyMatch(location -> isLocationRelevantOrig(location, startDate, endDate, patientBundleId));
+
+        return returnValue;
     }
 
-    private static boolean isLocationRelevant(Encounter.EncounterLocationComponent location, Date startDate, Date endDate) {
+    private static boolean isEncounterInRange(Encounter encounter, Date startDate, Date endDate, String patientBundleId) {
+        if (encounter.getPeriod() == null) {
+            return false;
+        }
+
+        Date encounterStart = encounter.getPeriod().getStart();
+        Date encounterEnd = encounter.getPeriod().getEnd();
+
+        if (encounterStart == null && encounterEnd == null) {
+            return false;
+        }
+
+        boolean returnValue =  (encounterStart == null || !encounterStart.after(startDate)) &&
+                (encounterEnd == null || !encounterEnd.before(endDate));
+
+        return returnValue;
+
+
+    }
+
+    private static boolean isLocationRelevantOrig(Encounter.EncounterLocationComponent location, Date startDate, Date endDate, String patientBundleId) {
+
         if (location.getPeriod() == null) {
             return false; // If no period is specified, consider it NOT relevant
         }
@@ -189,13 +285,15 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
         Date locationStart = location.getPeriod().getStart();
         Date locationEnd = location.getPeriod().getEnd();
 
-        // Period exists but both start/stop don't exist consider NOT relevant
+        // Period exists, but both start/stop don't exist consider NOT relevant
         if (locationStart == null && locationEnd == null) {
             return false;
         }
 
-        return (locationStart == null || !locationStart.after(startDate)) &&
+        boolean returnValue =  (locationStart == null || !locationStart.after(startDate)) &&
                 (locationEnd == null || !locationEnd.before(endDate));
+
+        return returnValue;
     }
 
     private Optional<NhsnLocation> getNhsnLocation(List<NhsnLocation> nhsnLocations, List<String> aliases) {
@@ -219,11 +317,13 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
 
 
         List<NhsnLocation> byUnit = nhsnLocations.stream()
-                .filter(location -> aliases.contains(location.getUnit()))
+                .filter(
+                        location -> aliases.contains(location.getUnit()) && location.getStatus().equals("A")
+                )
                 .collect(Collectors.toList());
 
         List<NhsnLocation> byCode = nhsnLocations.stream()
-                .filter(location -> aliases.contains(location.getCode()))
+                .filter(location -> aliases.contains(location.getCode()) && location.getStatus().equals("A"))
                 .collect(Collectors.toList());
 
         if (!byCode.isEmpty()) {
@@ -265,5 +365,25 @@ public class NdmsMeasureReportGenerator implements IMeasureReportGenerator {
         }
 
         return codeableConcept;
+    }
+
+    private List<Location> getLocationsForEncounter(Encounter encounter, Bundle bundle) {
+        return encounter.getLocation().stream()
+                .map(encounterLocation -> encounterLocation.getLocation().getReference()) // Get the reference strings
+                .filter(Objects::nonNull)
+                .map(reference -> findLocationInBundle(reference, bundle)) // Look up each reference in the bundle
+                .filter(Objects::nonNull) // Filter out any locations we couldn't find
+                .distinct()
+                .collect(Collectors.toList());
+    }
+
+    private Location findLocationInBundle(String reference, Bundle bundle) {
+        return bundle.getEntry().stream()
+                .map(Bundle.BundleEntryComponent::getResource)
+                .filter(Location.class::isInstance)
+                .map(Location.class::cast)
+                .filter(location -> reference.endsWith(location.getId()))
+                .findFirst()
+                .orElse(null);
     }
 }

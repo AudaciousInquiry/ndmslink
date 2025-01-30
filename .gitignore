@@ -36,4 +36,4 @@ Writerside/images/*
 Writerside/topics/*
 
 **/.aws-sam
-/.local.env
+/.env
